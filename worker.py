@@ -2,6 +2,7 @@
 """donto distributed embedding worker — lease -> embed (bge-small) -> submit.
 Talks ONLY to the coordinator HTTP API; never touches a database. The single
 secret is the bearer token. GPU: pip install fastembed-gpu and set EMBED_CUDA=1.
+Errors are auto-reported to the coordinator (POST /report, throttled 1/min).
 Canonical copy of the worker documented at https://donto.org/help."""
 import json, os, socket, time, urllib.request
 URL = os.environ.get("DONTO_EMBED_URL", "https://donto.org/embed").rstrip("/")
@@ -30,13 +31,22 @@ def model_for(name):
         if CUDA: kw["providers"] = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         _m[name] = TextEmbedding(**kw)
     return _m[name]
-total, win = 0, []
+_lr = 0.0
+def report_err(kind, msg):  # best-effort error telemetry, max 1/min
+    global _lr
+    if time.time() - _lr < 60: return
+    _lr = time.time()
+    try: post("/report", {"worker_id": WID, "kind": kind, "message": str(msg)[:1500]}, timeout=20)
+    except Exception: pass
+total, win, errs = 0, [], 0
 print(f"[{WID}] -> {URL} target={TARGET or 'any'} n={N} batch={BS} cuda={CUDA}", flush=True)
 while True:
     try:
         batch = post("/lease", {"worker_id": WID, "n": N, "target": TARGET}).get("batch", [])
+        errs = 0
     except Exception as e:
-        print(f"[{WID}] lease error: {e}", flush=True); time.sleep(IDLE); continue
+        errs += 1; print(f"[{WID}] lease error: {e}", flush=True)
+        report_err("lease", e); time.sleep(min(IDLE * errs, 60)); continue
     if not batch:
         time.sleep(IDLE); continue
     by = {}
@@ -51,5 +61,7 @@ while True:
         n = int(r.get("upserted", 0)); total += n
         now = time.time(); win.append((now, n)); win = [(t, c) for t, c in win if now - t < 60]
         print(f"[{WID}] +{n} (total {total}, ~{sum(c for _, c in win)}/min)", flush=True)
+        errs = 0
     except Exception as e:
-        print(f"[{WID}] submit error: {e}", flush=True); time.sleep(IDLE)
+        errs += 1; print(f"[{WID}] submit error: {e}", flush=True)
+        report_err("submit", e); time.sleep(min(IDLE * errs, 60))
